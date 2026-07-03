@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "kafka-python-ng>=2.2.3",
+    "langchain-core>=1.4.8",
+    "langgraph>=1.2.7",
     "matplotlib>=3.11.0",
+    "ollama>=0.6.2",
     "pandas>=3.0.3",
     "torch>=2.12.1",
 ]
