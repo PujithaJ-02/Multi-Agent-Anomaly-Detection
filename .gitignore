@@ -10,3 +10,5 @@ models/*
 .dagster/
 .tmp_dagster_home_*/
 src/orchestration/.tmp_dagster_home_*/
+docs/PROJECT_LOG.md
+*.PROJECT_LOG.md
