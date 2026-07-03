@@ -1,38 +1,26 @@
 # Multi-Agent Anomaly Detection System
 
-Real-time anomaly detection on streaming data using a PyTorch Transformer and a multi-agent pipeline.
+Real-time anomaly detection on a streaming data pipeline. A PyTorch Transformer scores every reading on a fast path, and flagged anomalies are escalated to a LangGraph multi-agent layer that reasons about them before raising an alert.
 
-## The idea
+## The idea: two speeds
 
-The system is designed to run at two speeds:
+The system runs at two speeds, and this split is the core design.
 
-- **Fast path.** A Transformer model scores every incoming reading and cheaply filters out the normal ones. This is built to keep up with a heavy stream.
-- **Slow path.** Only the small number of suspicious readings get escalated to a slower, multi-agent reasoning layer that decides what the anomaly is, how serious it is, and whether to raise an alert.
+- Fast path: a Transformer scores every incoming reading and cheaply flags the suspicious ones. Built for throughput. Measured at about 1.3 ms per reading.
+- Slow path: only flagged readings are handed off (through a background queue) to a team of agents that classify the anomaly, judge its severity, and decide whether to alert. This uses a language model, so it is slower, about 0.65 s per anomaly when warm.
 
-This split is what lets the system stay fast on a busy stream while still applying real judgment to the readings that actually matter.
+Running the language model only on the small number of flagged readings, instead of every reading, is what keeps the system fast while still applying real reasoning where it matters.
 
-## Current status
+## What it does
 
-This project is being built step by step. This section describes honestly what works today versus what is still planned.
+1. A producer streams temperature readings into Kafka, one at a time.
+2. A consumer (the fast path) keeps a rolling window of the last 64 readings, runs the Transformer, and flags readings whose prediction error crosses a threshold.
+3. Flagged readings go into a background queue. A worker runs a LangGraph agent graph on each: context, then classify (spike, drop, drift), then severity (low, medium, high), then a branch: high or medium severity raises an alert, low is logged only.
+4. Dagster orchestrates the offline lifecycle: preparing data, training, and evaluating the model on a schedule. It does not run the live stream.
 
-**Working now:**
+## Results (measured, reproducible)
 
-- Data exploration and preparation on a real anomaly-detection dataset (the NAB machine-temperature stream).
-- A PyTorch Transformer (encoder-based, forecasting approach) that learns normal behaviour and scores anomalies by how wrong its next-value prediction is.
-- An honest evaluation pipeline: time-based train/test split (no future leakage), a threshold chosen from training errors (not tuned on the test set), and results measured across 5 random seeds so the numbers are reproducible and not a lucky single run.
-
-**Planned (not built yet):**
-
-- Kafka streaming to feed the model a live event stream.
-- The multi-agent reasoning layer (LangChain and LangGraph) for the slow path.
-- Dagster to orchestrate data prep, training, and scheduled retraining.
-- Docker Compose to run the whole system with one command.
-
-The repository name mentions "multi-agent" because that is the design goal. The agent layer is on the roadmap above and is not implemented yet.
-
-## Results so far
-
-Measured on held-out test data, averaged across 5 random seeds:
+Model performance on held-out test data, averaged across 5 random seeds:
 
 | Metric | Value |
 |--------|-------|
@@ -40,55 +28,82 @@ Measured on held-out test data, averaged across 5 random seeds:
 | Recall | 0.43 (plus or minus 0.04) |
 | F1 | 0.55 (plus or minus 0.03) |
 
-These are numbers I measured myself and can reproduce. Notes on how I got here:
+Latency, measured end to end:
 
-- Training on data that accidentally included anomalies gave high precision (0.86) but poor recall (0.29). Removing the anomalies from the training data nearly doubled recall, at some cost to precision. That trade-off is intentional and documented.
-- A single training run is noisy, so I report the mean and spread across seeds rather than one cherry-picked result.
+| Stage | Latency |
+|-------|---------|
+| Fast path (score and flag) | about 1.3 ms per reading (warm) |
+| Slow path (full agent alert) | about 0.65 s per anomaly (warm), one-time cold start of a few seconds |
 
-Full reasoning and every decision are recorded in docs/PROJECT_LOG.md.
+Notes on how these were obtained, in the spirit of not overclaiming:
 
-## Dataset
+- Training on data that accidentally included anomalies gave high precision (0.86) but poor recall (0.29). Removing the anomalies from the training data raised recall to about 0.57, at some cost to precision. That trade-off is intentional.
+- A single training run is noisy, so I report the mean and spread across 5 seeds rather than one lucky run.
+- The reported "before" baseline for latency (a batch job leaving a multi-minute detection gap) is a framing of a typical batch interval, not a measured number. The streaming latencies above are measured.
 
-Numenta Anomaly Benchmark (NAB), the machine_temperature_system_failure stream: one temperature reading every 5 minutes from an industrial machine that eventually failed, with labeled anomaly periods. The data is small and slow, and is used here to learn the full pipeline. A larger, higher-throughput dataset is planned before the streaming claims are finalised.
+## Architecture and honest boundaries
 
-The raw data is not committed. To fetch it:
-
-    curl -sL "https://raw.githubusercontent.com/numenta/NAB/master/data/realKnownCause/machine_temperature_system_failure.csv" -o data/raw/machine_temp.csv
-    curl -sL "https://raw.githubusercontent.com/numenta/NAB/master/labels/combined_windows.json" -o data/raw/labels.json
+- Kafka and the producer run in Docker (see below).
+- The consumer runs on the host machine, not in a container, for two honest reasons: its agents call a local LLM (Ollama) running on the host, and the model uses Apple MPS (the Mac GPU), which a Linux container cannot access. Containers reach Kafka at kafka:29092; host tools reach it at localhost:9092.
 
 ## Tech stack
 
-Python, PyTorch. Planned: Kafka, LangChain, LangGraph, Dagster, Docker Compose.
+Python, PyTorch, Apache Kafka, LangChain, LangGraph, Dagster, Docker Compose, Ollama (local LLM: llama3.2).
+
+## Requirements
+
+- Docker Desktop (running)
+- uv (https://github.com/astral-sh/uv) for the Python environment
+- Ollama (https://ollama.com) with the llama3.2 model pulled, for the agent layer:
+
+      ollama pull llama3.2
 
 ## Setup
 
-This project uses uv (https://github.com/astral-sh/uv) for environment management.
+      uv sync
 
-    uv sync
+Fetch the dataset (not committed):
 
-## How to run (current pipeline)
+      curl -sL "https://raw.githubusercontent.com/numenta/NAB/master/data/realKnownCause/machine_temperature_system_failure.csv" -o data/raw/machine_temp.csv
+      curl -sL "https://raw.githubusercontent.com/numenta/NAB/master/labels/combined_windows.json" -o data/raw/labels.json
 
-    # 1. Explore the data
-    uv run python notebooks/01_explore.py
+## How to run
 
-    # 2. Prepare windowed data (cleaned training set)
-    cd src/data && uv run python preprocess_clean.py && cd ../..
+Start Kafka and the producer (streams the data automatically):
 
-    # 3. Train the final model (reproducible, seeded)
-    cd src/model && uv run python train_final.py && cd ../..
+      docker compose up --build
 
-    # 4. Measure honestly across seeds
-    cd src/model && uv run python experiment_seeds.py && cd ../..
+In another terminal, run the consumer (fast path plus agent slow path) on the host:
+
+      cd src/streaming && uv run python consumer.py
+
+To retrain or evaluate through the orchestrator, launch the Dagster UI:
+
+      cd src/orchestration && uv run dagster dev -f definitions.py
+
+Then open http://127.0.0.1:3000 and materialize the assets.
+
+## Training and evaluation (offline)
+
+      cd src/data && uv run python preprocess_clean.py && cd ../..
+      cd src/model && uv run python train_final.py && cd ../..
+      cd src/model && uv run python experiment_seeds.py && cd ../..
+
+## Dataset
+
+Numenta Anomaly Benchmark (NAB), the machine_temperature_system_failure stream: one temperature reading every 5 minutes from an industrial machine that eventually failed, with labeled anomaly periods. Small and slow, used here to build and learn the full pipeline. A larger, higher-throughput dataset would be the next step to stress the throughput claims.
 
 ## Project structure
 
-    src/
-      data/       data loading, windowing, cleaning
-      model/      the Transformer, training, evaluation, experiments
-    notebooks/    data exploration
-    data/         raw and processed data (not committed)
-    models/       saved weights (not committed)
-    docs/         project log with every decision and result
+      src/
+        data/          data loading, windowing, cleaning
+        model/         the Transformer, training, evaluation
+        streaming/     Kafka producer and the consumer (fast path + queue)
+        agents/        the LangGraph agent graph (slow path)
+        orchestration/ Dagster definitions
+      docker/          Dockerfile for the producer
+      docker-compose.yml
+      notebooks/       data exploration
 
 ## License
 
