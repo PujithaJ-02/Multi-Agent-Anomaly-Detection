@@ -13,7 +13,8 @@ import pandas as pd
 from kafka import KafkaProducer
 
 TOPIC = "temperature-readings"
-BROKER = "localhost:9092"
+import os
+BROKER = os.environ.get("KAFKA_BROKER", "localhost:9092")
 CSV_PATH = "../../data/raw/machine_temp.csv"
 DELAY_SECONDS = 0.05   # small gap between messages so it looks like a live stream
 

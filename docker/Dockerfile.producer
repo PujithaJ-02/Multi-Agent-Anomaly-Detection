@@ -1,0 +1,20 @@
+# Recipe to build a container that runs the Kafka producer.
+# It streams the NAB CSV into the "temperature-readings" topic.
+FROM python:3.12-slim
+
+# Install uv (the same tool I use locally) for consistent dependency handling.
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+
+# Copy only the dependency files first so Docker can cache the install layer.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# Copy the producer code and the raw data it streams.
+COPY src/streaming/producer.py ./src/streaming/producer.py
+COPY data/raw/machine_temp.csv ./data/raw/machine_temp.csv
+
+# Run the producer from the streaming folder.
+WORKDIR /app/src/streaming
+CMD ["uv", "run", "python", "producer.py"]
